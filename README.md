@@ -1,86 +1,86 @@
-# Prism Package Manager — Architecture & Specification
+# Prism Package Manager — How It Works
 
-## Architecture Overview
+---
 
-The Prism Package Manager is completely serverless—eliminating the need for custom backends, databases, or API gateways. The entire registry state, lifecycle, and automation workflow runs directly through GitHub infrastructure.
+## Architecture
 
-```text
-[Your Machine]                  [GitHub Registry Repo]           [Package Source Repo]
-      │                                    │                               │
-      ├─ prism publish ───────────────────►│─ Fork → Branch → PR ────────► GitHub Action
-      │                                    │  Auto-merges & builds tree    │
-      │                                    │                               │
-      └─ prism install ───────────────────►│─ Pull registry ─────────────► git clone
-         Writes to: ~/.prism/registry/     │  Resolves path dynamically    │  Writes to: ~/.local/lib/prism
-Registry Structure
-To avoid file system performance issues associated with flat directories, packages are organized inside a public GitHub repository (prism-package-repository) using a Cargo-style path partitioning strategy based on name length:
+The package manager is serverless — no backend, no database, no API gateway. Everything runs through GitHub:
+
+```
+[Your Machine]          [GitHub Registry Repo]         [Package Source Repo]
+     │                         │                              │
+     ├─ prism publish ────────►│  Fork → Branch → PR ──►  GitHub Action
+     │                         │  auto-merges, builds tree   │
+     │                         │                              │
+     ├─ prism install ────────►│  Pull registry ─────────►  git clone
+     │   ~/.prism/registry/    │  Resolve path               │  → ~/.local/lib/prism
 ```
 
-Plaintext
+---
+
+## Registry Structure (Cargo-style path partitioning)
+
+Packages live in a GitHub repo (`prism-package-repository`) organized by name length to avoid flat-directory performance issues:
+
+```
 index/
-├── 1/a             # 1-character names (e.g., "a")
-├── 2/go            # 2-character names (e.g., "go")
-├── 3/h/hub         # 3-character names, grouped by the first letter
-└── ht/tp/http      # 4+ character names, sharded by first two / next two letters
-Metadata Format
-Each package file consists of Newline-Delimited JSON (NDJSON). Every line represents a unique published version:
-
-```JSON
-{"vers":"0.1.0","repo":"[https://github.com/prism-packages/http](https://github.com/prism-packages/http)","deps":["json"]}
-{"vers":"0.2.0","repo":"[https://github.com/prism-packages/http](https://github.com/prism-packages/http)","deps":["json","ssl"]}
-Note: The final line of the file is always interpreted as the latest stable release.
+├── 1/a            ← 1-char names (e.g., "a")
+├── 2/go           ← 2-char names (e.g., "go")
+├── 3/h/hub        ← 3-char names, grouped by first letter
+└── ht/tp/http     ← 4+ char names, grouped by first two / next two letters
 ```
 
-Commands Specification
+Each file is newline-delimited JSON (like Cargo), one version per line:
+
+```json
+{"vers":"0.1.0","repo":"https://github.com/prism-packages/http","deps":["json"]}
+{"vers":"0.2.0","repo":"https://github.com/prism-packages/http","deps":["json","ssl"]}
+```
+
+> The last line is always the latest version.
+
+---
+
+## `prism publish`
+
+```
 prism publish
-Publishes the package in the current working directory to the global registry.
+```
 
-Bash
-prism publish
-Lifecycle Steps:
-Validation: Parses and validates prism-package.json to ensure required fields (name, version, repo) contain only shell-safe characters.
+1. Validates `prism-package.json` (name, version, repo — all checked for shell-safe characters)
+2. Forks the registry repo via GitHub API using your `PRISM_GITHUB_TOKEN`
+3. Creates a branch `publish/<name>-<version>` with the metadata
+4. Opens a PR — a GitHub Action auto-validates, computes the correct path, appends the entry, and squash-merges
 
-Forking: Forks the central registry repository via the GitHub API using the developer's local PRISM_GITHUB_TOKEN.
+---
 
-Branching: Creates a new isolated branch named publish/<name>-<version> containing the metadata change.
+## `prism install`
 
-Pull Request: Opens a PR against the upstream registry. A GitHub Action automatically validates the request, computes the deterministic destination path, appends the entry, and squash-merges the PR into main.
-
-prism install
-Installs a remote package from the global registry, or links a local package folder.
-
-Bash
-prism install <package_name>
-prism install <local_path>
-Example:
-Bash
+```
 prism install http
-Lifecycle Steps for Remote Packages:
-Registry Sync: Synchronizes the central registry state to ~/.prism/registry/ (git clone on first invocation; git pull on subsequent runs).
+```
 
-Path Resolution: Evaluates the package name length to locate the precise target file path (e.g., "http" resolves directly to index/ht/tp/http).
+1. Syncs registry to `~/.prism/registry/` (git clone on first use, git pull after)
+2. Resolves path — knows exactly where to look: `index/ht/tp/http` for "http"
+3. Parses the last line to get the latest version + repo URL
+4. Clones the package repo into `~/.local/lib/prism/packages/http/`
 
-Metadata Parsing: Reads the final line of the resolved file to extract the latest version string and source repository URL.
+For local packages: `prism install ./my-package` just copies the folder.
 
-Cloning: Executes a secure git clone of the target package source into ~/.local/lib/prism/packages/http/.
+---
 
-Lifecycle Steps for Local Packages:
-Bash
-prism install ./my-package
-Copies the specified directory directly into the local project cache without hitting the remote network.
+## Security
 
-Security Architecture
-Injection Mitigation: Package names, version strings, and repository URLs are strictly validated against a comprehensive alphanumeric allowlist before interacting with any low-level system() operations.
+- **No shell injection:** package names, versions, and repo URLs are validated against strict character allowlists before ever touching `system()`
+- **No token in process listings:** Git auth uses `GIT_ASKPASS` with a temp script instead of embedding the token in clone URLs
+- **Curl payloads:** single-quote escaping prevents shell break-out in GitHub API calls
 
-Process Listing Protection: Git authentication processes utilize GIT_ASKPASS combined with transient background scripts, ensuring sensitive authentication tokens are never exposed in plaintext via standard process monitoring tools (like ps).
+---
 
-Payload Isolation: Outgoing GitHub API HTTP interactions utilize strict single-quote parameter escaping to prevent accidental or malicious shell breakouts during token execution.
+## No Infrastructure Costs
 
-Cost & Infrastructure Scale
-The entire ecosystem leverages GitHub’s core infrastructure tiers to maintain zero operational runtime costs:
+The entire system runs on GitHub's free tier:
 
-Registry State Storage: Maintained inside a public, git-backed repository.
-
-Publishing Automation: Driven entirely by on-demand GitHub Actions workflows configured in .github/workflows/publish.yml.
-
-Package Hosting: Distributed across authors' individual code repositories, linked globally via simple URL tracking.
+- **Registry storage** = a public GitHub repo
+- **Publishing automation** = a GitHub Action in `.github/workflows/publish.yml`
+- **Package hosting** = package authors' own repos (linked by URL in the registry)
